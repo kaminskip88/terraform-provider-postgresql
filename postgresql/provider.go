@@ -18,6 +18,16 @@ const (
 func Provider() terraform.ResourceProvider {
 	return &schema.Provider{
 		Schema: map[string]*schema.Schema{
+			"scheme": {
+				Type:     schema.TypeString,
+				Optional: true,
+				Default:  "postgres",
+				ValidateFunc: validation.StringInSlice([]string{
+					"postgres",
+					"awspostgres",
+					"gcppostgres",
+				}, false),
+			},
 			"host": {
 				Type:        schema.TypeString,
 				Optional:    true,
@@ -58,9 +68,9 @@ func Provider() terraform.ResourceProvider {
 			},
 
 			"superuser": {
-				Type:     schema.TypeBool,
-				Optional: true,
-				Default:  true,
+				Type:        schema.TypeBool,
+				Optional:    true,
+				DefaultFunc: schema.EnvDefaultFunc("PGSUPERUSER", true),
 				Description: "Specify if the user to connect as is a Postgres superuser or not." +
 					"If not, some feature might be disabled (e.g.: Refreshing state password from Postgres)",
 			},
@@ -130,6 +140,7 @@ func Provider() terraform.ResourceProvider {
 			"postgresql_default_privileges": resourcePostgreSQLDefaultPrivileges(),
 			"postgresql_extension":          resourcePostgreSQLExtension(),
 			"postgresql_grant":              resourcePostgreSQLGrant(),
+			"postgresql_grant_role":         resourcePostgreSQLGrantRole(),
 			"postgresql_schema":             resourcePostgreSQLSchema(),
 			"postgresql_role":               resourcePostgreSQLRole(),
 		},
@@ -159,6 +170,7 @@ func providerConfigure(d *schema.ResourceData) (interface{}, error) {
 	version, _ := semver.ParseTolerant(versionStr)
 
 	config := Config{
+		Scheme:            d.Get("scheme").(string),
 		Host:              d.Get("host").(string),
 		Port:              d.Get("port").(int),
 		Username:          d.Get("username").(string),
@@ -182,10 +194,6 @@ func providerConfigure(d *schema.ResourceData) (interface{}, error) {
 		}
 	}
 
-	client, err := config.NewClient(d.Get("database").(string))
-	if err != nil {
-		return nil, fmt.Errorf("Error initializing PostgreSQL client: %w", err)
-	}
-
+	client := config.NewClient(d.Get("database").(string))
 	return client, nil
 }

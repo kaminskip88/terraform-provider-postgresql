@@ -1,8 +1,137 @@
-## 1.7.0 (Unreleased)
+## Unreleased
+
+## 1.11.2 (February 16, 2021)
+
+FIXES:
+
+* Fix connect_timeout for gocloud - @ynaka81
+  [#56](https://github.com/cyrilgdn/terraform-provider-postgresql/pull/56)
+
+
+## 1.11.1 (February 2, 2021)
+
+FIXES:
+
+* Fix building of connection string parameters - @mcwarman
+  [#47](https://github.com/cyrilgdn/terraform-provider-postgresql/pull/47)
+
+
+## 1.11.0 (January 10, 2021)
 
 FEATURES:
 
-* `postgresql_grant`: Implement grant on functions
+* gocloud: Allow to connect with [GoCloud](https://gocloud.dev/howto/sql/) to AWS/GCP instances - @cyrilgdn
+  [#29](https://github.com/cyrilgdn/terraform-provider-postgresql/pull/29)
+
+* `postgresql_grant`: Manage grant on schema - @cyrilgdn
+  [#30](https://github.com/cyrilgdn/terraform-provider-postgresql/pull/30)
+
+  :warning: This depreciates the `policy` attribute in `postgresql_schema`
+
+* `postgresql_grant`: Allow an empty privileges list (revoke) - @cyrilgdn
+  [#26](https://github.com/cyrilgdn/terraform-provider-postgresql/pull/26)
+
+* `postgresql_grant` / `postgresql_default_privileges`: Manage `PUBLIC` role - @cyrilgdn
+  [#27](https://github.com/cyrilgdn/terraform-provider-postgresql/pull/27)
+
+## 1.10.0 (January 2, 2021)
+
+FEATURES:
+
+* `postgresql_database`: Drop connections before drop database (Postgresql >=13) - @p4cket
+  [#14](https://github.com/cyrilgdn/terraform-provider-postgresql/pull/14)
+
+  :warning: In previous versions, Terraform failed to drop databases if they are still in used.
+            Now databases will be dropped in any case.
+
+* Use lazy connections - @cyrilgdn
+  [#5](https://github.com/cyrilgdn/terraform-provider-postgresql/pull/5)
+
+
+## 1.9.0 (December 21, 2020)
+
+FEATURES:
+* `postgresql_grant_role` (New resource): Grant role to another role - @dvdliao
+  [#4](https://github.com/cyrilgdn/terraform-provider-postgresql/pull/4)
+
+FIXES:
+
+* `postgresql_role`: Fix quoted search_path - @lovromazgon
+  [#1](https://github.com/cyrilgdn/terraform-provider-postgresql/pull/1)
+
+* `postgresql_grant`: Fix SQL error on function - @p4cket
+  [#15](https://github.com/cyrilgdn/terraform-provider-postgresql/pull/15)
+
+## 1.8.1 (November 26, 2020)
+
+BUG FIXES:
+
+* Revert "Use lazy connections" [#199](https://github.com/terraform-providers/terraform-provider-postgresql/pull/199)
+  Plugin panics if not able to connect to the database.
+
+## 1.8.0 (November 26, 2020)
+
+FEATURES:
+
+* `postgresql_extension`: Support drop cascade.
+  ([#162](https://github.com/terraform-providers/terraform-provider-postgresql/pull/162) - @multani)
+
+* ~~Use lazy connections.
+  ([#199](https://github.com/terraform-providers/terraform-provider-postgresql/pull/199) - @estahn)~~ (Reverted in 1.8.1)
+
+BUG FIXES:
+
+* `postgresql_grant`: Fix grant on function by removing `prokind` column selection.
+  ([#171](https://github.com/terraform-providers/terraform-provider-postgresql/pull/171) - @Tommi2Day)
+
+DEV IMPROVEMENTS:
+
+* Set up Github Workflows to create releases.
+  ([#3](https://github.com/cyrilgdn/terraform-provider-postgresql/pull/3) - @thenonameguy)
+
+## 1.7.2 (July 30, 2020)
+
+This is the first release on [Terraform registry](https://registry.terraform.io/providers/cyrilgdn/postgresql/latest)
+
+DEV IMPROVEMENTS:
+
+* Add goreleaser config
+* Pusblish on Terraform registry: https://registry.terraform.io/providers/cyrilgdn/postgresql/latest
+
+## 1.7.1 (July 30, 2020)
+
+BUG FIXES:
+
+* all resources: Fix some specific use case on `withRolesGranted` helper.
+  ([#162](https://github.com/terraform-providers/terraform-provider-postgresql/pull/162))
+
+* `postgresql_role`: Fix `bypass_row_level_security` attribute.
+  ([#158](https://github.com/terraform-providers/terraform-provider-postgresql/pull/158))
+
+## 1.7.0 (July 17, 2020)
+
+FEATURES:
+
+* all resources: Grant object owners to connected user when needed.
+  This greatly improves support of non-superuser admin (e.g.: on AWS RDS)
+  ([#146](https://github.com/terraform-providers/terraform-provider-postgresql/pull/146))
+
+* `postgresql_grant`, `postgresql_default_privileges`: Implement grant on functions.
+  ([#144](https://github.com/terraform-providers/terraform-provider-postgresql/pull/144))
+
+* `postgresql_default_privileges`: Implement grant on type.
+  ([#134](https://github.com/terraform-providers/terraform-provider-postgresql/pull/134))
+
+DEV IMPROVEMENTS:
+
+* Upgrade to Go 1.14 and replace errwrap.Wrapf by fmt.Errorf.
+  ([#145](https://github.com/terraform-providers/terraform-provider-postgresql/pull/145))
+
+
+DOCUMENTATION:
+
+* Improve documentation of `postgresql_grant`
+  ([#149](https://github.com/terraform-providers/terraform-provider-postgresql/pull/149) and [#151](https://github.com/terraform-providers/terraform-provider-postgresql/pull/151))
 
 ## 1.6.0 (May 22, 2020)
 

@@ -14,6 +14,9 @@ func TestAccPostgresqlExtension_Basic(t *testing.T) {
 		PreCheck: func() {
 			testAccPreCheck(t)
 			testCheckCompatibleVersion(t, featureExtension)
+			// TODO: Need to check how RDS manage to allow `rds_supuser` to create extension
+			// even it's not a real superuser
+			testSuperuserPreCheck(t)
 		},
 		Providers:    testAccProviders,
 		CheckDestroy: testAccCheckPostgresqlExtensionDestroy,
@@ -116,6 +119,7 @@ func TestAccPostgresqlExtension_SchemaRename(t *testing.T) {
 		PreCheck: func() {
 			testAccPreCheck(t)
 			testCheckCompatibleVersion(t, featureExtension)
+			testSuperuserPreCheck(t)
 		},
 		Providers:    testAccProviders,
 		CheckDestroy: testAccCheckPostgresqlExtensionDestroy,
@@ -182,6 +186,7 @@ func TestAccPostgresqlExtension_Database(t *testing.T) {
 		PreCheck: func() {
 			testAccPreCheck(t)
 			testCheckCompatibleVersion(t, featureExtension)
+			testSuperuserPreCheck(t)
 		},
 		Providers:    testAccProviders,
 		CheckDestroy: testAccCheckPostgresqlExtensionDestroy,
@@ -202,6 +207,55 @@ func TestAccPostgresqlExtension_Database(t *testing.T) {
 			},
 		},
 	})
+}
+
+func TestAccPostgresqlExtension_DropCascade(t *testing.T) {
+	skipIfNotAcc(t)
+
+	var testAccPostgresqlExtensionConfig = `
+resource "postgresql_extension" "cascade" {
+  name = "pgcrypto"
+  drop_cascade = true
+}
+`
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() {
+			testAccPreCheck(t)
+			testCheckCompatibleVersion(t, featureExtension)
+			testSuperuserPreCheck(t)
+		},
+		Providers:    testAccProviders,
+		CheckDestroy: testAccCheckPostgresqlExtensionDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: testAccPostgresqlExtensionConfig,
+				Check: resource.ComposeTestCheckFunc(
+					testAccCheckPostgresqlExtensionExists("postgresql_extension.cascade"),
+					resource.TestCheckResourceAttr("postgresql_extension.cascade", "name", "pgcrypto"),
+					// This will create a dependency on the extension.
+					testAccCreateExtensionDependency("test_extension_cascade"),
+				),
+			},
+		},
+	})
+}
+
+func testAccCreateExtensionDependency(tableName string) resource.TestCheckFunc {
+	return func(s *terraform.State) error {
+
+		client := testAccProvider.Meta().(*Client)
+		db, err := client.Connect()
+		if err != nil {
+			return err
+		}
+
+		_, err = db.Exec(fmt.Sprintf("DROP TABLE IF EXISTS %s; CREATE TABLE %s (id uuid DEFAULT gen_random_uuid())", tableName, tableName))
+		if err != nil {
+			return fmt.Errorf("could not create test table in schema: %s", err)
+		}
+
+		return nil
+	}
 }
 
 var testAccPostgresqlExtensionConfig = `

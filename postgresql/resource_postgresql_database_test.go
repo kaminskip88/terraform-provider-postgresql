@@ -139,7 +139,11 @@ func TestAccPostgresqlDatabase_Update(t *testing.T) {
 			testAccPreCheck(t)
 
 			client := testAccProvider.Meta().(*Client)
-			allowConnections = client.featureSupported(featureDBAllowConnections)
+			db, err := client.Connect()
+			if err != nil {
+				t.Fatalf("could not connect to database: %v", err)
+			}
+			allowConnections = db.featureSupported(featureDBAllowConnections)
 
 		},
 		Providers:    testAccProviders,
@@ -351,8 +355,12 @@ func testAccCheckPostgresqlDatabaseExists(n string) resource.TestCheckFunc {
 }
 
 func checkDatabaseExists(client *Client, dbName string) (bool, error) {
+	db, err := client.Connect()
+	if err != nil {
+		return false, err
+	}
 	var _rez int
-	err := client.DB().QueryRow("SELECT 1 from pg_database d WHERE datname=$1", dbName).Scan(&_rez)
+	err = db.QueryRow("SELECT 1 from pg_database d WHERE datname=$1", dbName).Scan(&_rez)
 	switch {
 	case err == sql.ErrNoRows:
 		return false, nil
@@ -386,7 +394,6 @@ resource "postgresql_database" "default_opts" {
    encoding = "UTF8"
    lc_collate = "C"
    lc_ctype = "C"
-   tablespace_name = "pg_default"
    connection_limit = -1
    is_template = false
 }
@@ -398,7 +405,6 @@ resource "postgresql_database" "modified_opts" {
    encoding = "UTF8"
    lc_collate = "en_US.UTF-8"
    lc_ctype = "en_US.UTF-8"
-   tablespace_name = "pg_default"
    connection_limit = 10
    is_template = true
 }
@@ -410,7 +416,6 @@ resource "postgresql_database" "pathological_opts" {
    encoding = "LATIN1"
    lc_collate = "C"
    lc_ctype = "C"
-   tablespace_name = "pg_default"
    connection_limit = 0
    is_template = true
 }

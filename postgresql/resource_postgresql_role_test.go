@@ -3,6 +3,7 @@ package postgresql
 import (
 	"database/sql"
 	"fmt"
+	"os"
 	"reflect"
 	"sort"
 	"strings"
@@ -47,19 +48,48 @@ func TestAccPostgresqlRole_Basic(t *testing.T) {
 
 					resource.TestCheckResourceAttr("postgresql_role.role_with_create_database", "name", "role_with_create_database"),
 					resource.TestCheckResourceAttr("postgresql_role.role_with_create_database", "create_database", "true"),
-					resource.TestCheckResourceAttr("postgresql_role.role_with_superuser", "name", "role_with_superuser"),
-					resource.TestCheckResourceAttr("postgresql_role.role_with_superuser", "superuser", "true"),
-					resource.TestCheckResourceAttr("postgresql_role.role_with_defaults", "roles.#", "0"),
 
 					testAccCheckPostgresqlRoleExists("sub_role", []string{"myrole2", "role_simple"}, nil),
 					resource.TestCheckResourceAttr("postgresql_role.sub_role", "name", "sub_role"),
 					resource.TestCheckResourceAttr("postgresql_role.sub_role", "roles.#", "2"),
 
-					testAccCheckPostgresqlRoleExists("role_with_search_path", nil, []string{"bar", "foo"}),
+					testAccCheckPostgresqlRoleExists("role_with_search_path", nil, []string{"bar", "foo-with-hyphen"}),
 
 					// The int part in the attr name is the schema.HashString of the value.
 					resource.TestCheckResourceAttr("postgresql_role.sub_role", "roles.719783566", "myrole2"),
 					resource.TestCheckResourceAttr("postgresql_role.sub_role", "roles.1784536243", "role_simple"),
+				),
+			},
+		},
+	})
+}
+
+// Test creating a superuser role.
+func TestAccPostgresqlRole_Superuser(t *testing.T) {
+
+	roleConfig := `
+resource "postgresql_role" "role_with_superuser" {
+  name = "role_with_superuser"
+  superuser = true
+  login = true
+  password = "mypass"
+}`
+
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() {
+			testAccPreCheck(t)
+			testCheckCompatibleVersion(t, featurePrivileges)
+			// Need to a be a superuser to create a superuser
+			testSuperuserPreCheck(t)
+		},
+		Providers:    testAccProviders,
+		CheckDestroy: testAccCheckPostgresqlRoleDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: roleConfig,
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr("postgresql_role.role_with_superuser", "name", "role_with_superuser"),
+					resource.TestCheckResourceAttr("postgresql_role.role_with_superuser", "superuser", "true"),
 				),
 			},
 		},
@@ -157,6 +187,42 @@ resource "postgresql_role" "update_role" {
 	})
 }
 
+// Test to create a role with admin user (usually postgres) granted to it
+// There were a bug on RDS like setup (with a non-superuser postgres role)
+// where it couldn't delete the role in this case.
+func TestAccPostgresqlRole_AdminGranted(t *testing.T) {
+	admin := os.Getenv("PGUSER")
+	if admin == "" {
+		admin = "postgres"
+	}
+
+	roleConfig := fmt.Sprintf(`
+resource "postgresql_role" "test_role" {
+  name  = "test_role"
+  roles = [
+	  "%s"
+  ]
+}`, admin)
+
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() {
+			testAccPreCheck(t)
+			testCheckCompatibleVersion(t, featurePrivileges)
+		},
+		Providers:    testAccProviders,
+		CheckDestroy: testAccCheckPostgresqlRoleDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: roleConfig,
+				Check: resource.ComposeTestCheckFunc(
+					testAccCheckPostgresqlRoleExists("test_role", []string{admin}, nil),
+					resource.TestCheckResourceAttr("postgresql_role.test_role", "name", "test_role"),
+				),
+			},
+		},
+	})
+}
+
 func testAccCheckPostgresqlRoleDestroy(s *terraform.State) error {
 	client := testAccProvider.Meta().(*Client)
 
@@ -208,8 +274,12 @@ func testAccCheckPostgresqlRoleExists(roleName string, grantedRoles []string, se
 }
 
 func checkRoleExists(client *Client, roleName string) (bool, error) {
+	db, err := client.Connect()
+	if err != nil {
+		return false, err
+	}
 	var _rez int
-	err := client.DB().QueryRow("SELECT 1 from pg_roles d WHERE rolname=$1", roleName).Scan(&_rez)
+	err = db.QueryRow("SELECT 1 from pg_roles d WHERE rolname=$1", roleName).Scan(&_rez)
 	switch {
 	case err == sql.ErrNoRows:
 		return false, nil
@@ -237,8 +307,13 @@ func testAccCheckRoleCanLogin(t *testing.T, role, password string) resource.Test
 }
 
 func checkGrantedRoles(client *Client, roleName string, expectedRoles []string) error {
-	rows, err := client.DB().Query(
-		"SELECT role_name FROM information_schema.applicable_roles WHERE grantee=$1 ORDER BY role_name",
+	db, err := client.Connect()
+	if err != nil {
+		return err
+	}
+
+	rows, err := db.Query(
+		"SELECT pg_get_userbyid(roleid) as rolname from pg_auth_members WHERE pg_get_userbyid(member) = $1 ORDER BY rolname",
 		roleName,
 	)
 	if err != nil {
@@ -258,7 +333,7 @@ func checkGrantedRoles(client *Client, roleName string, expectedRoles []string) 
 	sort.Strings(expectedRoles)
 	if !reflect.DeepEqual(grantedRoles, expectedRoles) {
 		return fmt.Errorf(
-			"Role %s is not a members of the expected list of roles. expected %v - got %v",
+			"Role %s is not a member of the expected list of roles. expected %v - got %v",
 			roleName, expectedRoles, grantedRoles,
 		)
 	}
@@ -266,8 +341,13 @@ func checkGrantedRoles(client *Client, roleName string, expectedRoles []string) 
 }
 
 func checkSearchPath(client *Client, roleName string, expectedSearchPath []string) error {
+	db, err := client.Connect()
+	if err != nil {
+		return err
+	}
+
 	var searchPathStr string
-	err := client.DB().QueryRow(
+	err = db.QueryRow(
 		"SELECT (pg_options_to_table(rolconfig)).option_value FROM pg_roles WHERE rolname=$1;",
 		roleName,
 	).Scan(&searchPathStr)
@@ -280,6 +360,9 @@ func checkSearchPath(client *Client, roleName string, expectedSearchPath []strin
 	}
 
 	searchPath := strings.Split(searchPathStr, ", ")
+	for i := range searchPath {
+		searchPath[i] = strings.Trim(searchPath[i], `"`)
+	}
 	sort.Strings(expectedSearchPath)
 	if !reflect.DeepEqual(searchPath, expectedSearchPath) {
 		return fmt.Errorf(
@@ -326,7 +409,6 @@ resource "postgresql_role" "role_with_defaults" {
   encrypted_password = true
   password = ""
   skip_drop_role = false
-  skip_reassign_owned = false
   valid_until = "infinity"
   statement_timeout = 0
 }
@@ -346,13 +428,6 @@ resource "postgresql_role" "sub_role" {
 
 resource "postgresql_role" "role_with_search_path" {
   name = "role_with_search_path"
-  search_path = ["bar", "foo"]
-}
-
-resource "postgresql_role" "role_with_superuser" {
-  name = "role_with_superuser"
-  superuser = true
-  login = true
-  password = "mypass"
+  search_path = ["bar", "foo-with-hyphen"]
 }
 `

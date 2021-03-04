@@ -1,16 +1,20 @@
 package postgresql
 
 import (
-	"bytes"
+	"context"
 	"database/sql"
 	"fmt"
-	"log"
+	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"unicode"
 
 	"github.com/blang/semver"
 	_ "github.com/lib/pq" //PostgreSQL db
+	"gocloud.dev/postgres"
+	_ "gocloud.dev/postgres/awspostgres"
+	_ "gocloud.dev/postgres/gcppostgres"
 )
 
 type featureName uint
@@ -21,21 +25,17 @@ const (
 	featureDBIsTemplate
 	featureFallbackApplicationName
 	featureRLS
-	featureReassignOwnedCurrentUser
 	featureSchemaCreateIfNotExist
 	featureReplication
 	featureExtension
 	featurePrivileges
+	featureForceDropDatabase
+	featurePid
 )
-
-type dbRegistryEntry struct {
-	db      *sql.DB
-	version semver.Version
-}
 
 var (
 	dbRegistryLock sync.Mutex
-	dbRegistry     map[string]dbRegistryEntry = make(map[string]dbRegistryEntry, 1)
+	dbRegistry     map[string]*DBConnection = make(map[string]*DBConnection, 1)
 
 	// Mapping of feature flags to versions
 	featureSupported = map[featureName]semver.Range{
@@ -54,9 +54,6 @@ var (
 		// CREATE SCHEMA IF NOT EXISTS
 		featureSchemaCreateIfNotExist: semver.MustParseRange(">=9.3.0"),
 
-		// REASSIGN OWNED BY { old_role | CURRENT_USER
-		featureReassignOwnedCurrentUser: semver.MustParseRange(">=9.5.0"),
-
 		// row-level security
 		featureRLS: semver.MustParseRange(">=9.5.0"),
 
@@ -69,8 +66,50 @@ var (
 		// We do not support postgresql_grant and postgresql_default_privileges
 		// for Postgresql < 9.
 		featurePrivileges: semver.MustParseRange(">=9.0.0"),
+
+		// DROP DATABASE WITH FORCE
+		// for Postgresql >= 13
+		featureForceDropDatabase: semver.MustParseRange(">=13.0.0"),
+
+		// Column procpid was replaced by pid in pg_stat_activity
+		// for Postgresql >= 9.2 and above
+		featurePid: semver.MustParseRange(">=9.2.0"),
 	}
 )
+
+type DBConnection struct {
+	*sql.DB
+
+	client *Client
+
+	// version is the version number of the database as determined by parsing the
+	// output of `SELECT VERSION()`.x
+	version semver.Version
+}
+
+// featureSupported returns true if a given feature is supported or not. This is
+// slightly different from Config's featureSupported in that here we're
+// evaluating against the fingerprinted version, not the expected version.
+func (db *DBConnection) featureSupported(name featureName) bool {
+	fn, found := featureSupported[name]
+	if !found {
+		// panic'ing because this is a provider-only bug
+		panic(fmt.Sprintf("unknown feature flag %v", name))
+	}
+
+	return fn(db.version)
+}
+
+// isSuperuser returns true if connected user is a Postgres SUPERUSER
+func (db *DBConnection) isSuperuser() (bool, error) {
+	var superuser bool
+
+	if err := db.QueryRow("SELECT rolsuper FROM pg_roles WHERE rolname = CURRENT_USER").Scan(&superuser); err != nil {
+		return false, fmt.Errorf("could not check if current user is superuser: %w", err)
+	}
+
+	return superuser, nil
+}
 
 type ClientCertificateConfig struct {
 	CertificatePath string
@@ -79,6 +118,7 @@ type ClientCertificateConfig struct {
 
 // Config - provider config
 type Config struct {
+	Scheme            string
 	Host              string
 	Port              int
 	Username          string
@@ -102,14 +142,6 @@ type Client struct {
 
 	databaseName string
 
-	// db is a pointer to the DB connection.  Callers are responsible for
-	// releasing their connections.
-	db *sql.DB
-
-	// version is the version number of the database as determined by parsing the
-	// output of `SELECT VERSION()`.x
-	version semver.Version
-
 	// PostgreSQL lock on pg_catalog.  Many of the operations that Terraform
 	// performs are not permitted to be concurrent.  Unlike traditional
 	// PostgreSQL tables that use MVCC, many of the PostgreSQL system
@@ -119,50 +151,11 @@ type Client struct {
 }
 
 // NewClient returns client config for the specified database.
-func (c *Config) NewClient(database string) (*Client, error) {
-	dbRegistryLock.Lock()
-	defer dbRegistryLock.Unlock()
-
-	dsn := c.connStr(database)
-	dbEntry, found := dbRegistry[dsn]
-	if !found {
-		db, err := sql.Open("postgres", dsn)
-		if err != nil {
-			return nil, fmt.Errorf("Error connecting to PostgreSQL server: %w", err)
-		}
-
-		// We don't want to retain connection
-		// So when we connect on a specific database which might be managed by terraform,
-		// we don't keep opened connection in case of the db has to be dopped in the plan.
-		db.SetMaxIdleConns(0)
-		db.SetMaxOpenConns(c.MaxConns)
-
-		defaultVersion, _ := semver.Parse(defaultExpectedPostgreSQLVersion)
-		version := &c.ExpectedVersion
-		if defaultVersion.Equals(c.ExpectedVersion) {
-			// Version hint not set by user, need to fingerprint
-			version, err = fingerprintCapabilities(db)
-			if err != nil {
-				db.Close()
-				return nil, fmt.Errorf("error detecting capabilities: %w", err)
-			}
-		}
-
-		dbEntry = dbRegistryEntry{
-			db:      db,
-			version: *version,
-		}
-		dbRegistry[dsn] = dbEntry
-	}
-
-	client := Client{
+func (c *Config) NewClient(database string) *Client {
+	return &Client{
 		config:       *c,
 		databaseName: database,
-		db:           dbEntry.db,
-		version:      dbEntry.version,
 	}
-
-	return &client, nil
 }
 
 // featureSupported returns true if a given feature is supported or not.  This
@@ -178,122 +171,55 @@ func (c *Config) featureSupported(name featureName) bool {
 	return fn(c.ExpectedVersion)
 }
 
+func (c *Config) connParams() []string {
+	params := map[string]string{}
+
+	// sslmode and connect_timeout are not allowed with gocloud
+	// (TLS is provided by gocloud directly)
+	if c.Scheme == "postgres" {
+		params["sslmode"] = c.SSLMode
+		params["connect_timeout"] = strconv.Itoa(c.ConnectTimeoutSec)
+	}
+
+	if c.featureSupported(featureFallbackApplicationName) {
+		params["fallback_application_name"] = c.ApplicationName
+	}
+	if c.SSLClientCert != nil {
+		params["sslcert"] = c.SSLClientCert.CertificatePath
+		params["sslkey"] = c.SSLClientCert.KeyPath
+	}
+
+	if c.SSLRootCertPath != "" {
+		params["sslrootcert"] = c.SSLRootCertPath
+	}
+
+	paramsArray := []string{}
+	for key, value := range params {
+		paramsArray = append(paramsArray, fmt.Sprintf("%s=%s", key, url.QueryEscape(value)))
+	}
+
+	return paramsArray
+}
+
 func (c *Config) connStr(database string) string {
-	// NOTE: dbname must come before user otherwise dbname will be set to
-	// user.
-	var dsnFmt string
-	{
-		dsnFmtParts := []string{
-			"host=%s",
-			"port=%d",
-			"dbname=%s",
-			"user=%s",
-			"password=%s",
-			"sslmode=%s",
-			"connect_timeout=%d",
-		}
+	host := c.Host
 
-		if c.featureSupported(featureFallbackApplicationName) {
-			dsnFmtParts = append(dsnFmtParts, "fallback_application_name=%s")
-		}
-		if c.SSLClientCert != nil {
-			dsnFmtParts = append(
-				dsnFmtParts,
-				"sslcert=%s",
-				"sslkey=%s",
-			)
-		}
-		if c.SSLRootCertPath != "" {
-			dsnFmtParts = append(dsnFmtParts, "sslrootcert=%s")
-		}
-
-		dsnFmt = strings.Join(dsnFmtParts, " ")
+	// For GCP, support both project/region/instance and project:region:instance
+	// (The second one allows to use the output of google_sql_database_instance as host
+	if c.Scheme == "gcppostgres" {
+		host = strings.ReplaceAll(host, ":", "/")
 	}
 
-	// Quote empty strings or strings that contain whitespace
-	quote := func(s string) string {
-		b := bytes.NewBufferString(`'`)
-		b.Grow(len(s) + 2)
-		var haveWhitespace bool
-		for _, r := range s {
-			if unicode.IsSpace(r) {
-				haveWhitespace = true
-			}
-
-			switch r {
-			case '\'':
-				b.WriteString(`\'`)
-			case '\\':
-				b.WriteString(`\\`)
-			default:
-				b.WriteRune(r)
-			}
-		}
-
-		b.WriteString(`'`)
-
-		str := b.String()
-		if haveWhitespace || len(str) == 2 {
-			return str
-		}
-		return str[1 : len(str)-1]
-	}
-
-	{
-		logValues := []interface{}{
-			quote(c.Host),
-			c.Port,
-			quote(database),
-			quote(c.Username),
-			quote("<redacted>"),
-			quote(c.SSLMode),
-			c.ConnectTimeoutSec,
-		}
-		if c.featureSupported(featureFallbackApplicationName) {
-			logValues = append(logValues, quote(c.ApplicationName))
-		}
-		if c.SSLClientCert != nil {
-			logValues = append(
-				logValues,
-				quote(c.SSLClientCert.CertificatePath),
-				quote(c.SSLClientCert.KeyPath),
-			)
-		}
-		if c.SSLRootCertPath != "" {
-			logValues = append(logValues, quote(c.SSLRootCertPath))
-		}
-
-		logDSN := fmt.Sprintf(dsnFmt, logValues...)
-		log.Printf("[INFO] PostgreSQL DSN: `%s`", logDSN)
-	}
-
-	var connStr string
-	{
-		connValues := []interface{}{
-			quote(c.Host),
-			c.Port,
-			quote(database),
-			quote(c.Username),
-			quote(c.Password),
-			quote(c.SSLMode),
-			c.ConnectTimeoutSec,
-		}
-		if c.featureSupported(featureFallbackApplicationName) {
-			connValues = append(connValues, quote(c.ApplicationName))
-		}
-		if c.SSLClientCert != nil {
-			connValues = append(
-				connValues,
-				quote(c.SSLClientCert.CertificatePath),
-				quote(c.SSLClientCert.KeyPath),
-			)
-		}
-		if c.SSLRootCertPath != "" {
-			connValues = append(connValues, quote(c.SSLRootCertPath))
-		}
-
-		connStr = fmt.Sprintf(dsnFmt, connValues...)
-	}
+	connStr := fmt.Sprintf(
+		"%s://%s:%s@%s:%d/%s?%s",
+		c.Scheme,
+		url.QueryEscape(c.Username),
+		url.QueryEscape(c.Password),
+		host,
+		c.Port,
+		database,
+		strings.Join(c.connParams(), "&"),
+	)
 
 	return connStr
 }
@@ -305,11 +231,54 @@ func (c *Config) getDatabaseUsername() string {
 	return c.Username
 }
 
-// DB returns a copy to an sql.Open()'ed database connection.  Callers must
-// return their database resources.  Use of QueryRow() or Exec() is encouraged.
+// Connect returns a copy to an sql.Open()'ed database connection wrapped in a DBConnection struct.
+// Callers must return their database resources. Use of QueryRow() or Exec() is encouraged.
 // Query() must have their rows.Close()'ed.
-func (c *Client) DB() *sql.DB {
-	return c.db
+func (c *Client) Connect() (*DBConnection, error) {
+	dbRegistryLock.Lock()
+	defer dbRegistryLock.Unlock()
+
+	dsn := c.config.connStr(c.databaseName)
+	conn, found := dbRegistry[dsn]
+	if !found {
+
+		var db *sql.DB
+		var err error
+		if c.config.Scheme == "postgres" {
+			db, err = sql.Open("postgres", dsn)
+		} else {
+			db, err = postgres.Open(context.Background(), dsn)
+		}
+		if err != nil {
+			return nil, fmt.Errorf("Error connecting to PostgreSQL server %s (scheme: %s): %w", c.config.Host, c.config.Scheme, err)
+		}
+
+		// We don't want to retain connection
+		// So when we connect on a specific database which might be managed by terraform,
+		// we don't keep opened connection in case of the db has to be dopped in the plan.
+		db.SetMaxIdleConns(0)
+		db.SetMaxOpenConns(c.config.MaxConns)
+
+		defaultVersion, _ := semver.Parse(defaultExpectedPostgreSQLVersion)
+		version := &c.config.ExpectedVersion
+		if defaultVersion.Equals(c.config.ExpectedVersion) {
+			// Version hint not set by user, need to fingerprint
+			version, err = fingerprintCapabilities(db)
+			if err != nil {
+				db.Close()
+				return nil, fmt.Errorf("error detecting capabilities: %w", err)
+			}
+		}
+
+		conn = &DBConnection{
+			db,
+			c,
+			*version,
+		}
+		dbRegistry[dsn] = conn
+	}
+
+	return conn, nil
 }
 
 // fingerprintCapabilities queries PostgreSQL to populate a local catalog of
@@ -336,28 +305,4 @@ func fingerprintCapabilities(db *sql.DB) (*semver.Version, error) {
 	}
 
 	return &version, nil
-}
-
-// featureSupported returns true if a given feature is supported or not. This is
-// slightly different from Config's featureSupported in that here we're
-// evaluating against the fingerprinted version, not the expected version.
-func (c *Client) featureSupported(name featureName) bool {
-	fn, found := featureSupported[name]
-	if !found {
-		// panic'ing because this is a provider-only bug
-		panic(fmt.Sprintf("unknown feature flag %v", name))
-	}
-
-	return fn(c.version)
-}
-
-// isSuperuser returns true if connected user is a Postgres SUPERUSER
-func (c *Client) isSuperuser() (bool, error) {
-	var superuser bool
-
-	if err := c.db.QueryRow("SELECT rolsuper FROM pg_roles WHERE rolname = CURRENT_USER").Scan(&superuser); err != nil {
-		return false, fmt.Errorf("could not check if current user is superuser: %w", err)
-	}
-
-	return superuser, nil
 }
